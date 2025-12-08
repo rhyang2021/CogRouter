@@ -1,0 +1,1313 @@
+import torch
+import numpy as np
+from verl import DataProto
+from verl.utils.dataset.rl_dataset import collate_fn
+from verl.utils.model import compute_position_id_with_mask
+import verl.utils.torch_functional as verl_F
+from transformers import PreTrainedTokenizer
+import uuid
+import pdb
+from verl.models.transformers.qwen2_vl import get_rope_index
+from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
+from agent_system.environments import EnvironmentManagerBase
+from typing import List, Dict, Tuple, Any, Optional, Union
+
+from rlvmr import core_rlvmr as core_mcrl
+from rlvcr import core_rlvcr
+
+class TrajectoryCollector:
+    
+    def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
+        """
+        Initialize the TrajectoryProcessor class.
+        
+        Parameters:
+            config: Configuration object containing data processing settings
+            tokenizer (PreTrainedTokenizer): Tokenizer for text encoding and decoding
+            processor: Image processor for multimodal inputs
+        """
+        self.config = config
+        self.tokenizer = tokenizer
+        self.processor = processor
+
+    def preprocess_single_sample(
+        self,
+        item: int,
+        gen_batch: DataProto,
+        obs: Dict,
+    ):
+        """
+        Process a single observation sample, organizing environment observations (text and/or images) 
+        into a format processable by the model.
+        
+        Parameters:
+            item (int): Sample index in the batch
+            gen_batch (DataProto): Batch data containing original prompts
+            obs (Dict): Environment observation, may contain 'text', 'image', 'anchor' keys
+        
+        Returns:
+            dict: Contains processed input data such as input_ids, attention_mask, etc.
+        """
+
+        raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
+        data_source = gen_batch.non_tensor_batch['data_source'][item]
+        
+        # Get observation components
+        obs_texts = obs.get('text', None)
+        obs_images = obs.get('image', None)
+        obs_anchors = obs.get('anchor', None)
+        obs_text = obs_texts[item] if obs_texts is not None else None
+        obs_image = obs_images[item] if obs_images is not None else None
+        obs_anchor = obs_anchors[item] if obs_anchors is not None else None
+        is_multi_modal = obs_image is not None
+
+        _obs_anchor = torch_to_numpy(obs_anchor, is_object=True) if isinstance(obs_anchor, torch.Tensor) else obs_anchor
+
+        # Build chat structure
+        obs_content = raw_prompt[0]['content']
+        if '<image>' in obs_content: 
+            obs_content = obs_content.replace('<image>', '')
+
+        if obs_text is not None:
+            obs_content += obs_text
+        
+        chat = np.array([{
+            "content": obs_content,
+            "role": "user",
+        }])
+
+        # Apply chat template
+        prompt_with_chat_template = self.tokenizer.apply_chat_template(
+            chat,
+            add_generation_prompt=True,
+            tokenize=False
+        )
+
+        # Initialize return dict
+        row_dict = {}
+
+        # Process multimodal data
+        if is_multi_modal:
+            # Replace image placeholder with vision tokens
+            raw_prompt = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
+            row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
+            image_inputs = self.processor.image_processor(row_dict['multi_modal_data']['image'], return_tensors='pt')
+            image_grid_thw = image_inputs['image_grid_thw']
+            row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
+            if image_grid_thw is not None:
+                merge_length = self.processor.image_processor.merge_size**2
+                index = 0
+                while '<image>' in prompt_with_chat_template:
+                    prompt_with_chat_template = prompt_with_chat_template.replace(
+                        '<image>',
+                        '<|vision_start|>' + '<|placeholder|>' * (image_grid_thw[index].prod() // merge_length) +
+                        '<|vision_end|>',
+                        1,
+                    )
+                    index += 1
+
+                prompt_with_chat_template = prompt_with_chat_template.replace('<|placeholder|>',
+                                                                                self.processor.image_token)
+
+        else:
+            raw_prompt = prompt_with_chat_template
+
+        input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
+                                                                            tokenizer=self.tokenizer,
+                                                                            max_length=self.config.data.max_prompt_length,
+                                                                            pad_token_id=self.tokenizer.pad_token_id,
+                                                                            left_pad=True,
+                                                                            truncation='error')
+        
+    
+        if is_multi_modal:
+            position_ids = get_rope_index(
+                self.processor,
+                input_ids=input_ids[0],
+                image_grid_thw=image_grid_thw,
+                attention_mask=attention_mask[0],
+            )  # (3, seq_len)
+        else:
+            position_ids = compute_position_id_with_mask(attention_mask)
+
+        # Build final output dict
+        row_dict.update({
+            'input_ids': input_ids[0],
+            'attention_mask': attention_mask[0],
+            'position_ids': position_ids[0],
+            'raw_prompt_ids': self.tokenizer.encode(raw_prompt, add_special_tokens=False),
+            'anchor_obs': _obs_anchor,
+            'index': item,
+            'data_source': data_source
+        })
+
+
+        if self.config.data.get('return_raw_chat', False):
+            row_dict['raw_prompt'] = chat.tolist()
+
+        return row_dict
+
+    def preprocess_batch(
+        self,
+        gen_batch: DataProto, 
+        obs: Dict, 
+    ) -> DataProto:
+        
+        """
+        Process a batch of observation samples, converting environment observations into model-processable format.
+        
+        Parameters:
+            gen_batch (DataProto): Batch data containing original prompts
+            obs (Dict): Environment observation dictionary
+                - 'text' (None or List[str]): Text observation data
+                - 'image' (np.ndarray or torch.Tensor): Image observation data
+                - 'anchor' (None or Any): Anchor observation without any histories or additional info. (for GiGPO only).
+        
+        Returns:
+            DataProto: Contains processed batch data with preserved metadata
+        """
+        batch_size = len(gen_batch.batch['input_ids'])
+        processed_samples = []
+
+        # Process each sample in parallel
+        for item in range(batch_size):
+            # Extract per-sample observations
+            processed = self.preprocess_single_sample(
+                item=item,
+                gen_batch=gen_batch,
+                obs=obs,
+            )
+            processed_samples.append(processed)
+
+        # Aggregate batch data
+        batch = collate_fn(processed_samples)
+
+        # Create DataProto with preserved metadata
+        new_batch = DataProto.from_single_dict(
+            data=batch,
+            meta_info=gen_batch.meta_info
+        )
+
+        return new_batch
+
+    def gather_rollout_data(
+            self,
+            total_batch_list: List[List[Dict]],
+            episode_rewards: np.ndarray,
+            episode_lengths: np.ndarray,
+            success: Dict[str, np.ndarray],
+            traj_uid: np.ndarray,
+            total_infos: List[List[Dict]] = None,
+            ) -> DataProto:
+        """
+        Collect and organize trajectory data, handling batch size adjustments to meet parallel training requirements.
+        
+        Parameters:
+            total_batch_list (List[List[Dict]): List of trajectory data for each environment
+            episode_rewards (np.ndarray): Total rewards for each environment
+            episode_lengths (np.ndarray): Total steps for each environment
+            success (Dict[str, np.ndarray]): Success samples for each environment
+            traj_uid (np.ndarray): Trajectory unique identifiers
+        
+        Returns:
+            DataProto: Collected and organized trajectory data
+        """
+        batch_size = len(total_batch_list)
+
+        episode_rewards_mean = np.mean(episode_rewards)
+        episode_rewards_min = np.min(episode_rewards)
+        episode_rewards_max = np.max(episode_rewards)
+
+        episode_lengths_mean = np.mean(episode_lengths)
+        episode_lengths_min = np.min(episode_lengths)
+        episode_lengths_max = np.max(episode_lengths)
+
+        success_rate = {}
+        for key, value in success.items():
+            success_rate[key] = np.mean(value)
+
+        effective_batch = []
+        traj_length = []
+
+        for bs in range(batch_size):
+            # sum the rewards for each data in total_batch_list[bs]
+            valid_step = 0
+            for data in total_batch_list[bs]:
+                assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
+                if data['active_masks']:
+                    # episode_rewards
+                    data['episode_rewards'] = episode_rewards[bs]
+                    data['episode_rewards_mean'] = episode_rewards_mean
+                    data['episode_rewards_min'] = episode_rewards_min
+                    data['episode_rewards_max'] = episode_rewards_max
+                    # episode_lengths
+                    data['episode_lengths'] = episode_lengths[bs]
+                    data['episode_lengths_mean'] = episode_lengths_mean
+                    data['episode_lengths_min'] = episode_lengths_min
+                    data['episode_lengths_max'] = episode_lengths_max
+                    # success_rate
+                    for key, value in success_rate.items():
+                        data[key] = value
+                    
+                    # 添加环境信息（如果有）
+                    if total_infos is not None and bs < len(total_infos) and len(total_infos[bs]) > 0:
+                        # 使用第一步的info，因为task description在整个trajectory中是不变的
+                        first_info = total_infos[bs][0]
+                        if 'task_description' in first_info:
+                            data['task_description'] = first_info['task_description']
+                        if 'task_num' in first_info:
+                            data['task_num'] = first_info['task_num']
+                        
+                        # 添加当前步骤的环境信息
+                        step_idx_in_traj = valid_step
+                        if step_idx_in_traj < len(total_infos[bs]):
+                            current_info = total_infos[bs][step_idx_in_traj]
+                            if 'observation_text' in current_info:
+                                data['observation_text'] = current_info['observation_text']
+                            if 'score' in current_info:
+                                data['score'] = current_info['score']
+                            if 'task_score' in current_info:
+                                data['task_score'] = current_info['task_score']
+                            if 'won' in current_info:
+                                data['won'] = current_info['won']
+                            if 'available_actions' in current_info:
+                                data['available_actions'] = current_info['available_actions']
+                            if 'possible_actions' in current_info:
+                                data['possible_actions'] = current_info['possible_actions']
+                    
+                    valid_step += 1
+                    effective_batch.append(data)
+            traj_length.append(valid_step)  
+
+        # Convert trajectory data to DataProto format
+        gen_batch_output = DataProto.from_single_dict(
+            data=collate_fn(effective_batch)
+        )
+
+        gen_batch_output.meta_info["traj_length"] = traj_length
+        traj_length_stat = {
+            "traj_length_mean": np.mean(traj_length),
+            "traj_length_min": np.min(traj_length),
+            "traj_length_max": np.max(traj_length),
+        }
+        gen_batch_output.meta_info["traj_length_stat"] = traj_length_stat
+
+        return gen_batch_output
+
+    def vanilla_multi_turn_loop(
+            self,
+            gen_batch: DataProto, 
+            actor_rollout_wg, 
+            envs: EnvironmentManagerBase,
+            ) -> DataProto:
+        """
+        Collects trajectories through parallel agent-environment agent_loop.
+        Parameters:
+            gen_batch (DataProto): Initial batch with prompts to start the agent_loop
+            actor_rollout_wg (WorkerGroup): Worker group containing the actor model for policy decisions
+            envs (EnvironmentManagerBase): Environment manager containing parallel environment instances
+        
+        Returns:
+            total_batch_list (List[Dict]): List of trajectory data for each environment
+            episode_rewards (np.ndarray): Total rewards for each environment
+            episode_lengths (np.ndarray): Total steps for each environment
+            success (Dict[str, np.ndarray]): Success samples for each environment
+            traj_uid (np.ndarray): Trajectory unique identifiers
+        """
+        # Initial observations from the environment
+        obs, infos = envs.reset()
+        
+        # Initialize trajectory collection
+        lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
+        if len(gen_batch.batch) != lenght_obs and self.config.env.rollout.n > 0:
+            gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
+        assert len(gen_batch.batch) == lenght_obs, f"gen_batch size {len(gen_batch.batch)} does not match obs size {lenght_obs}"
+
+        batch_size = len(gen_batch.batch['input_ids'])
+        batch_output = None
+
+        if self.config.env.rollout.n > 0: # env grouping
+            uid_batch = []
+            for i in range(batch_size):
+                if i % self.config.env.rollout.n == 0:
+                    uid = str(uuid.uuid4())
+                uid_batch.append(uid)
+            uid_batch = np.array(uid_batch, dtype=object)
+        else: # no env grouping, set all to the same uid
+            uid = str(uuid.uuid4())
+            uid_batch = np.array([uid for _ in range(len(gen_batch.batch))], dtype=object)
+        is_done = np.zeros(batch_size, dtype=bool)
+        traj_uid = np.array([str(uuid.uuid4()) for _ in range(batch_size)], dtype=object)
+        total_batch_list = [[] for _ in range(batch_size)]
+        total_infos = [[] for _ in range(batch_size)]
+        episode_lengths = np.zeros(batch_size, dtype=np.int32)
+        episode_rewards = np.zeros(batch_size, dtype=np.float32)
+        # Trajectory collection loop
+        for _step in range(self.config.env.max_steps):
+            active_masks = np.logical_not(is_done)
+
+            batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
+
+            if 'multi_modal_inputs' in batch.non_tensor_batch.keys():
+                batch_input = batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                    non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+                )
+            else:
+                batch_input = batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                    non_tensor_batch_keys=['raw_prompt_ids'],
+                )
+
+            batch_input.meta_info = gen_batch.meta_info
+
+            batch_output = actor_rollout_wg.generate_sequences(batch_input)
+
+            batch.non_tensor_batch['uid'] = uid_batch
+            batch.non_tensor_batch['traj_uid'] = traj_uid
+
+            batch = batch.union(batch_output)
+
+            text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+            # print(text_actions)
+            # print('-----------------')
+            next_obs, rewards, dones, infos = envs.step(text_actions)
+            print(rewards)
+
+            batch.non_tensor_batch['full_output'] = text_actions
+
+            if len(rewards.shape) == 2:
+                rewards = rewards.squeeze(1)
+            if len(dones.shape) == 2:
+                # dones is numpy, delete a dimension
+                dones = dones.squeeze(1)
+
+            if 'is_action_valid' in infos[0]:
+                batch.non_tensor_batch['is_action_valid'] = np.array([info['is_action_valid'] for info in infos], dtype=bool)
+            else:
+                batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
+
+            batch.non_tensor_batch['action_available'] = np.array([info['action_available'] for info in infos], dtype=bool)
+
+            # Create reward tensor, only assign rewards for active environments
+            episode_rewards += torch_to_numpy(rewards) * torch_to_numpy(active_masks)
+            episode_lengths[active_masks] += 1
+
+            assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
+            batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
+            batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
+
+            # Update episode lengths for active environments
+            batch_list: list[dict] = to_list_of_dict(batch)
+
+            for i in range(batch_size):
+                total_batch_list[i].append(batch_list[i])
+                total_infos[i].append(infos[i])
+
+            # Update done states
+            is_done = np.logical_or(is_done, dones)
+
+            # Update observations for next step
+            obs = next_obs
+
+            # Break if all environments are done
+            if is_done.all():
+                break
+
+        success: Dict[str, np.ndarray] = envs.success_evaluator(
+                    total_infos=total_infos,
+                    total_batch_list=total_batch_list,
+                    episode_rewards=episode_rewards, 
+                    episode_lengths=episode_lengths,
+                    )
+
+        return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, total_infos
+
+    def dynamic_multi_turn_loop(
+            self,
+            gen_batch: DataProto, 
+            actor_rollout_wg, 
+            envs: EnvironmentManagerBase,
+            ) -> DataProto:
+        """
+        Conduct dynamic rollouts until a target batch size is met. 
+        Keeps sampling until the desired number of effective trajectories is collected.
+        Adopted from DAPO (https://arxiv.org/abs/2503.14476)
+
+        Args:
+            gen_batch (DataProto): Initial batch for rollout.
+            actor_rollout_wg: Actor model workers for generating responses.
+            envs (EnvironmentManagerBase): Environment manager instance.
+
+        Returns:
+            total_batch_list (List[Dict]): Complete set of rollout steps.
+            total_episode_rewards (np.ndarray): Accumulated rewards.
+            total_episode_lengths (np.ndarray): Lengths per episode.
+            total_success (Dict[str, np.ndarray]): Success metrics.
+            total_traj_uid (np.ndarray): Trajectory IDs.
+        """
+        total_batch_list = []
+        total_episode_rewards = []
+        total_episode_lengths = []
+        total_success = []
+        total_traj_uid = []
+        try_count: int = 0
+        max_try_count = self.config.algorithm.filter_groups.max_num_gen_batches
+
+        while len(total_batch_list) < self.config.data.train_batch_size * self.config.env.rollout.n and try_count < max_try_count:
+
+            if len(total_batch_list) > 0:
+                print(f"valid num={len(total_batch_list)} < target num={self.config.data.train_batch_size * self.config.env.rollout.n}. Keep generating... ({try_count}/{max_try_count})")
+            try_count += 1
+
+            batch_list, episode_rewards, episode_lengths, success, traj_uid, infos = self.vanilla_multi_turn_loop(
+                gen_batch=gen_batch,
+                actor_rollout_wg=actor_rollout_wg,
+                envs=envs,
+            )
+            batch_list, episode_rewards, episode_lengths, success, traj_uid = filter_group_data(batch_list=batch_list,
+                                                                                                episode_rewards=episode_rewards, 
+                                                                                                episode_lengths=episode_lengths, 
+                                                                                                success=success, 
+                                                                                                traj_uid=traj_uid, 
+                                                                                                config=self.config,
+                                                                                                last_try=(try_count == max_try_count),
+                                                                                                )
+            
+            total_batch_list += batch_list
+            total_episode_rewards.append(episode_rewards)
+            total_episode_lengths.append(episode_lengths)
+            total_success.append(success)
+            total_traj_uid.append(traj_uid)
+
+        total_episode_rewards = np.concatenate(total_episode_rewards, axis=0)
+        total_episode_lengths = np.concatenate(total_episode_lengths, axis=0)
+        total_success = {key: np.concatenate([success[key] for success in total_success], axis=0) for key in total_success[0].keys()}
+        total_traj_uid = np.concatenate(total_traj_uid, axis=0)
+
+        # 注意：dynamic模式下暂不支持task_description，因为多次调用会使infos变得复杂
+        return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, None
+
+    def multi_turn_loop(
+            self,
+            gen_batch: DataProto, 
+            actor_rollout_wg, 
+            envs: EnvironmentManagerBase,
+            is_train: bool = True,
+            ) -> DataProto:
+        
+        """
+        Select and run the appropriate rollout loop (RLVCR, dynamic, or vanilla).
+
+        Args:
+            gen_batch (DataProto): Initial prompt batch.
+            actor_rollout_wg: Actor model workers.
+            envs (EnvironmentManagerBase): Environment manager for interaction.
+            is_train (bool): Whether in training mode (affects sampling choice).
+
+        Returns:
+            DataProto: Final collected trajectory data with metadata.
+        """
+
+        # Check if RLVCR sampling should be used
+        if (hasattr(self.config, 'algorithm') and 
+            hasattr(self.config.algorithm, 'adv_estimator') and 
+            self.config.algorithm.adv_estimator == 'rlvcr' and
+            hasattr(self.config.algorithm, 'rlvcr') and 
+            self.config.algorithm.rlvcr.enable and
+            is_train):
+            # RLVCR Sampling (with multi-level thinking generation)
+            return self.rlvcr_multi_turn_loop(
+                gen_batch=gen_batch,
+                actor_rollout_wg=actor_rollout_wg,
+                envs=envs,
+            )
+        elif self.config.algorithm.filter_groups.enable and is_train:
+            # Dynamic Sampling (for DAPO and Dynamic GiGPO)
+            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_infos = \
+                self.dynamic_multi_turn_loop(
+                gen_batch=gen_batch,
+                actor_rollout_wg=actor_rollout_wg,
+                envs=envs,
+            )
+        else:
+            # Vanilla Sampling   
+            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_infos = \
+                self.vanilla_multi_turn_loop(
+                gen_batch=gen_batch,
+                actor_rollout_wg=actor_rollout_wg,
+                envs=envs,
+            )
+
+        assert len(total_batch_list) == len(total_episode_rewards)
+        assert len(total_batch_list) == len(total_episode_lengths)
+        assert len(total_batch_list) == len(total_traj_uid)
+
+        # add mcrl rewards into total_batch_list
+        if self.config.algorithm.mcrl.enable:
+            total_batch_list = core_mcrl.process_trajectory_rlvmr_rewards(
+                trajectory_list=total_batch_list, config=self.config, episode_rewards=total_episode_rewards
+            )
+
+        # Create trajectory data
+        gen_batch_output: DataProto = self.gather_rollout_data(
+            total_batch_list=total_batch_list,
+            episode_rewards=total_episode_rewards,
+            episode_lengths=total_episode_lengths,
+            success=total_success,
+            traj_uid=total_traj_uid,
+            total_infos=total_infos,
+        )
+        assert len(envs.buffers[0]) == len(total_batch_list[0]), "envs.buffers[0] and total_batch_list[0] should have the same length"
+        if self.config.algorithm.mcrl.enable:
+            gen_batch_output.meta_info["mcrl_step_advantage_w"] = (self.config.algorithm.mcrl.step_advantage_w)
+            gen_batch_output.meta_info["mcrl_mode"] = self.config.algorithm.mcrl.mode
+        return gen_batch_output
+
+    def rlvcr_multi_turn_loop(
+            self,
+            gen_batch: DataProto, 
+            actor_rollout_wg, 
+            envs: EnvironmentManagerBase,
+            ) -> DataProto:
+        """
+        RLVCR trajectory collection with multi-level thinking generation.
+        """
+        # Collect base trajectories
+        total_batch_list, episode_rewards, episode_lengths, success, traj_uid, total_infos = \
+            self.vanilla_multi_turn_loop(gen_batch, actor_rollout_wg, envs)
+        
+        # Convert to DataProto format
+        base_result = self.gather_rollout_data(
+            total_batch_list=total_batch_list,
+            episode_rewards=episode_rewards,
+            episode_lengths=episode_lengths,
+            success=success, 
+            traj_uid=traj_uid,
+            total_infos=total_infos,
+        )
+        
+        # Generate alternative thinking levels
+        base_result = self._generate_alternative_thinking_levels(base_result, actor_rollout_wg)
+        
+        # Store RLVCR configuration
+        rlvcr_config = self.config.algorithm.rlvcr
+        base_result.meta_info.update({
+            "rlvcr_thinking_weight": getattr(rlvcr_config, 'thinking_weight', 0.5),
+            "rlvcr_thinking_diversity_w": getattr(rlvcr_config, 'thinking_diversity_w', 1.0),
+            "rlvcr_mode": getattr(rlvcr_config, 'mode', 'mean_norm')
+        })
+    
+        return base_result
+
+    def _generate_alternative_thinking_levels(
+            self, 
+            base_batch: DataProto, 
+            actor_rollout_wg
+        ) -> DataProto:
+        """
+        Generate alternative thinking levels for RLVCR.
+        Only processes successful trajectories and generates 4 thinking levels per trajectory.
+        """
+        batch_size = base_batch.batch['input_ids'].shape[0]
+        
+        # First, group by UID to check reward similarity
+        uid_to_rewards = {}
+        
+        for batch_idx in range(batch_size):
+            uid = base_batch.non_tensor_batch['uid'][batch_idx]
+            reward = base_batch.non_tensor_batch['episode_rewards'][batch_idx]
+            
+            if uid not in uid_to_rewards:
+                uid_to_rewards[uid] = []
+            
+            uid_to_rewards[uid].append(reward)
+        
+        # Identify UIDs with identical rewards
+        identical_reward_uids = set()
+        different_reward_uids = set()
+        
+        for uid, rewards in uid_to_rewards.items():
+            if len(rewards) > 1:
+                reward_range = max(rewards) - min(rewards)
+                if reward_range < 1e-6:  # Same threshold as in core_rlvcr.py
+                    identical_reward_uids.add(uid)
+                    print(f"RLVCR: UID {uid} has identical rewards ({rewards[0]:.6f}), will skip thinking expansion")
+                else:
+                    different_reward_uids.add(uid)
+            # Single-sample UIDs don't need checking
+        
+        print(f"RLVCR: {len(identical_reward_uids)} UIDs with identical rewards (will skip expansion)")
+        print(f"RLVCR: {len(different_reward_uids)} UIDs with different rewards (will expand)")
+        
+        # Now separate indices based on both success and reward similarity
+        failed_indices = []  # Failed trajectories (reward <= 0)
+        skip_thinking_indices = []  # Successful but identical rewards
+        expand_thinking_indices = []  # Successful with different rewards
+        
+        for batch_idx in range(batch_size):
+            uid = base_batch.non_tensor_batch['uid'][batch_idx]
+            episode_reward = base_batch.non_tensor_batch['episode_rewards'][batch_idx]
+            
+            # if episode_reward <= 0:
+                # failed_indices.append(batch_idx)
+            # elif uid in identical_reward_uids:
+                # skip_thinking_indices.append(batch_idx)
+            if uid in identical_reward_uids:
+                skip_thinking_indices.append(batch_idx)
+            else:
+                expand_thinking_indices.append(batch_idx)
+        
+        print(f"RLVCR: {len(failed_indices)} failed trajectories")
+        print(f"RLVCR: {len(skip_thinking_indices)} successful trajectories with identical rewards (skip expansion)")
+        print(f"RLVCR: {len(expand_thinking_indices)} successful trajectories to expand")
+        
+        all_samples = []
+        original_indices = []
+        expanded_indices = []
+        current_idx = 0
+        
+        # Process failed trajectories (simple samples)
+        for batch_idx in failed_indices:
+            sample = self._extract_single_sample(base_batch, batch_idx)
+            sample.update({
+                'is_original': True,
+                'thinking_group_id': -1,
+                'thinking_entropy': 0.0,
+                'thinking_cost': 0,
+                'original_level': -1,
+                'current_level': -1
+            })
+            all_samples.append(sample)
+            original_indices.append(current_idx)
+            current_idx += 1
+        
+        # Process successful trajectories with identical rewards (skip expansion)
+        for batch_idx in skip_thinking_indices:
+            sample = self._extract_single_sample(base_batch, batch_idx)
+            sample.update({
+                'is_original': True,
+                'thinking_group_id': -1,
+                'thinking_entropy': 0.0,
+                'thinking_cost': 0,
+                'original_level': -1,  # Mark as skipped
+                'current_level': -1
+            })
+            all_samples.append(sample)
+            original_indices.append(current_idx)
+            current_idx += 1
+        
+        # Process trajectories that need thinking expansion
+        if expand_thinking_indices:
+            print(f"RLVCR: Batch processing {len(expand_thinking_indices)} trajectories for thinking expansion")
+            successful_samples = self._batch_generate_thinking_alternatives(
+                expand_thinking_indices, base_batch, actor_rollout_wg
+            )
+            print(f"RLVCR: Generated {len(successful_samples)} trajectory groups")
+            
+            for samples_group in successful_samples:
+                if len(samples_group) == 4:
+                    # Valid 4-level samples
+                    for i, sample in enumerate(samples_group):
+                        sample['thinking_group_id'] = samples_group[0]['batch_idx']
+                        if i == sample['original_level'] - 1:
+                            sample['is_original'] = True
+                            original_indices.append(current_idx)
+                        else:
+                            sample['is_original'] = False
+                            expanded_indices.append(current_idx)
+                        all_samples.append(sample)
+                        current_idx += 1
+                else:
+                    # Invalid format - use single sample
+                    sample = samples_group[0]
+                    sample.update({
+                        'is_original': True,
+                        'thinking_group_id': -1
+                    })
+                    all_samples.append(sample)
+                    original_indices.append(current_idx)
+                    current_idx += 1
+        
+        # Assign new batch indices for all samples
+        for new_idx, sample in enumerate(all_samples):
+            sample['batch_idx'] = new_idx
+        
+        print(f"RLVCR: Final sample count:")
+        print(f"  - Failed: {len(failed_indices)}")
+        print(f"  - Identical rewards (skipped): {len(skip_thinking_indices)}")
+        print(f"  - Expanded groups: {len(successful_samples) if 'successful_samples' in locals() else 0}")
+        print(f"  - Total samples: {len(all_samples)}")
+        
+        # Create expanded batch using simplified collate function
+        expanded_batch = DataProto.from_single_dict(
+            data=self._rlvcr_collate_fn(all_samples),
+            meta_info=base_batch.meta_info
+        )
+        
+        # Store metadata for advantage computation
+        expanded_batch.meta_info.update({
+            'original_indices': original_indices,
+            'expanded_indices': expanded_indices
+        })
+        
+        return expanded_batch
+    
+    def _rlvcr_collate_fn(self, data_list: list[dict]) -> dict:
+        """Custom collate function for RLVCR with variable-length responses."""
+        from collections import defaultdict
+        
+        tensors = defaultdict(list)
+        non_tensors = defaultdict(list)
+
+        for data in data_list:
+            for key, val in data.items():
+                if isinstance(val, torch.Tensor):
+                    tensors[key].append(val)
+                else:
+                    non_tensors[key].append(val)
+
+        # Handle tensors with potential padding
+        for key, val in tensors.items():
+            if len(val) > 1:
+                shapes = [t.shape for t in val]
+                if not all(shape == shapes[0] for shape in shapes) and len(shapes[0]) == 1:
+                    # Pad 1D tensors (like responses) to same length
+                    max_len = max(t.shape[0] for t in val)
+                    padded_tensors = []
+                    for t in val:
+                        if t.shape[0] < max_len:
+                            padding = torch.zeros(max_len - t.shape[0], dtype=t.dtype)
+                            padded_t = torch.cat([t, padding], dim=0)
+                        else:
+                            padded_t = t
+                        padded_tensors.append(padded_t)
+                    tensors[key] = torch.stack(padded_tensors, dim=0)
+                else:
+                    tensors[key] = torch.stack(val, dim=0)
+            else:
+                tensors[key] = torch.stack(val, dim=0)
+
+        for key, val in non_tensors.items():
+            non_tensors[key] = np.array(val, dtype=object)
+
+        return {**tensors, **non_tensors}
+
+    def _extract_single_sample(self, batch: DataProto, idx: int) -> dict:
+        """
+        Extract a single sample from the batch as a dictionary.
+        """
+        sample = {}
+        
+        # Extract tensor data
+        for key in batch.batch.keys():
+            tensor = batch.batch[key]
+            if len(tensor.shape) > 0:
+                sample[key] = tensor[idx]
+            else:
+                sample[key] = tensor
+        
+        # Extract non-tensor data
+        for key in batch.non_tensor_batch.keys():
+            sample[key] = batch.non_tensor_batch[key][idx]
+        
+        return sample
+    
+
+
+    def _extract_from_response(self, response: str, tag: str) -> str:
+        """
+        Extract content from response by tag.
+        Args:
+            response: Full response text
+            tag: Tag name to extract (e.g., 'action', 'think', 'level')
+        Returns:
+            Content (without tags), or empty string if not found
+        """
+        import re
+        pattern = rf'<{tag}>(.*?)</{tag}>'
+        match = re.search(pattern, response, re.DOTALL | re.IGNORECASE)
+        return match.group(1).strip() if match else ""
+    
+    def _extract_level_from_response(self, response: str) -> Optional[int]:
+        """
+        Extract thinking level from response.
+        Args:
+            response: Full response text
+        Returns:
+            Level number (1-4) or None if not found/invalid
+        """
+        level_str = self._extract_from_response(response, 'level')
+        if not level_str:
+            return None
+        try:
+            level = int(level_str)
+            return level if 1 <= level <= 4 else None
+        except ValueError:
+            return None
+
+    def _handle_multi_gpu_generation(self, batch: DataProto, actor_rollout_wg):
+        """Handle multi-GPU generation - batch should already be GPU-aligned."""
+        return actor_rollout_wg.generate_sequences(batch)
+    
+    def _handle_multi_gpu_log_prob(self, batch: DataProto, actor_rollout_wg):
+        """Handle multi-GPU log probability computation - batch should already be GPU-aligned."""
+        return actor_rollout_wg.compute_log_prob(batch)
+
+    def _handle_multi_gpu_entropy(self, batch: DataProto, actor_rollout_wg):
+        """Handle multi-GPU entropy computation - batch should already be GPU-aligned."""
+        # 使用真正的 entropy 计算
+        return actor_rollout_wg.compute_entropy(batch)
+        
+    def _create_response_with_level(self, level: int, action: str, thinking_text: str) -> str:
+        """Create a complete response with specified thinking level."""
+        if level == 1:
+            return f"<level>1</level><action>{action}</action>"
+        else:
+            return f"<level>{level}</level><think>{thinking_text}</think><action>{action}</action>"
+
+    def _batch_generate_thinking_sequences(
+        self,
+        prompts: List[str],
+        actor_rollout_wg,
+        meta_info: dict,
+        original_action: str
+    ) -> List[str]:
+        """
+        Batch generate thinking sequences with chunking for memory safety.
+        """
+        if not prompts:
+            return []
+        
+        # Get chunking configuration
+        generation_chunk_size = getattr(self.config.algorithm.rlvcr, 'generation_chunk_size', 8)
+        
+        # Process in chunks if needed
+        if len(prompts) > generation_chunk_size:
+            all_results = []
+            for i in range(0, len(prompts), generation_chunk_size):
+                chunk_prompts = prompts[i:i + generation_chunk_size]
+                chunk_results = self._generate_thinking_chunk(chunk_prompts, actor_rollout_wg, meta_info)
+                all_results.extend(chunk_results)
+            return all_results
+        else:
+            return self._generate_thinking_chunk(prompts, actor_rollout_wg, meta_info)
+    
+    def _generate_thinking_chunk(
+        self,
+        prompts: List[str],
+        actor_rollout_wg,
+        meta_info: dict
+    ) -> List[str]:
+        """
+        Generate thinking sequences for a chunk of prompts.
+        """
+        # Tokenize and pad inputs
+        batch_inputs = []
+        for prompt in prompts:
+            tokenized = self.tokenizer(
+                prompt, return_tensors='pt', padding=False, truncation=True,
+                max_length=meta_info.get('max_prompt_length', 4096)
+            )
+            batch_inputs.append({
+                'input_ids': tokenized['input_ids'][0],
+                'attention_mask': tokenized['attention_mask'][0]
+            })
+        
+        # Pad to same length
+        max_len = max(len(inp['input_ids']) for inp in batch_inputs)
+        for inp in batch_inputs:
+            pad_len = max_len - len(inp['input_ids'])
+            if pad_len > 0:
+                inp['input_ids'] = torch.cat([torch.full((pad_len,), self.tokenizer.pad_token_id), inp['input_ids']])
+                inp['attention_mask'] = torch.cat([torch.zeros(pad_len), inp['attention_mask']])
+        
+        # Create generation batch with GPU-aligned size
+        original_batch_size = len(batch_inputs)
+        
+        # Ensure batch size is divisible by GPU count for multi-GPU systems
+        if hasattr(actor_rollout_wg, 'world_size') and actor_rollout_wg.world_size > 1:
+            gpu_count = actor_rollout_wg.world_size
+            if original_batch_size % gpu_count != 0:
+                # Pad batch to make it divisible by GPU count
+                pad_size = gpu_count - (original_batch_size % gpu_count)
+                # Duplicate last input to pad
+                for _ in range(pad_size):
+                    batch_inputs.append(batch_inputs[-1])  # Duplicate last input
+        
+        batch_input_ids = torch.stack([inp['input_ids'] for inp in batch_inputs])
+        batch_attention_mask = torch.stack([inp['attention_mask'] for inp in batch_inputs])
+        batch_position_ids = compute_position_id_with_mask(batch_attention_mask)
+        
+        generation_batch = DataProto.from_dict({
+            'input_ids': batch_input_ids,
+            'attention_mask': batch_attention_mask,
+            'position_ids': batch_position_ids
+        })
+        generation_batch.meta_info = meta_info.copy()
+        generation_batch.meta_info.update({
+            'response_length': 512,
+            'temperature': 0.7,
+            'do_sample': True,
+            'top_p': 0.9,
+        })
+        
+        # Generate with multi-GPU handling
+        output = self._handle_multi_gpu_generation(generation_batch, actor_rollout_wg)
+        
+        # Extract thinking sequences (only original batch size)
+        results = []
+        for i in range(len(prompts)):  # Process all original prompts
+            generated_response = self.tokenizer.decode(output.batch['responses'][i], skip_special_tokens=True)
+            thinking_sequence = self._extract_from_response(generated_response, 'think')
+            results.append(thinking_sequence if thinking_sequence else generated_response)
+        
+        return results
+
+    def _batch_compute_action_token_logits(
+        self,
+        input_prefixes: List[str],
+        action_token_ids: List[int],
+        actor_rollout_wg
+    ) -> List[float]:
+        """
+        Batch compute action token logits with adaptive chunking for memory safety.
+        Returns minimum log probabilities for each prefix.
+        """
+        if not input_prefixes:
+            return []
+        
+        # Dynamic chunking based on configuration and GPU memory
+        total_computations = len(input_prefixes) * len(action_token_ids)
+        
+        # Calculate safe chunk size based on GPU micro batch size
+        try:
+            base_micro_batch_size = getattr(self.config.actor_rollout_ref.rollout, 'log_prob_micro_batch_size_per_gpu', 8)
+        except AttributeError:
+            base_micro_batch_size = 8  # fallback
+        
+        try:
+            confidence_chunk_size = getattr(self.config.algorithm.rlvcr, 'confidence_chunk_size', base_micro_batch_size * 4)
+        except AttributeError:
+            confidence_chunk_size = base_micro_batch_size * 4  # fallback
+        
+        print(f"RLVCR: Computing {total_computations} confidence calculations, chunk_size={confidence_chunk_size}")
+        print(f"RLVCR: {len(input_prefixes)} prefixes × {len(action_token_ids)} tokens = {total_computations} total calculations")
+        
+        if total_computations > confidence_chunk_size:
+            # Process in chunks with GPU-friendly sizing
+            gpu_count = getattr(actor_rollout_wg, 'world_size', 1)
+            
+            # Calculate chunk size that results in GPU-divisible computations
+            # For 8 GPUs and 5 tokens: we want chunks that are multiples of 8
+            # So prefix_chunk_size should be chosen such that (prefix_chunk_size * 5) % 8 == 0
+            base_prefix_chunk_size = max(1, confidence_chunk_size // len(action_token_ids))
+            
+            # Robust GPU alignment algorithm for any token count
+            import math
+            token_count = len(action_token_ids)
+            
+            # Calculate LCM for perfect alignment
+            gcd_val = math.gcd(token_count, gpu_count)
+            lcm_tokens_gpus = (token_count * gpu_count) // gcd_val
+            min_prefix_chunk_for_alignment = lcm_tokens_gpus // token_count
+            
+            # Apply efficiency and memory constraints
+            max_reasonable_lcm = gpu_count * 16  # Limit LCM to avoid huge chunks
+            if lcm_tokens_gpus > max_reasonable_lcm:
+                # For large LCMs, use simpler GPU-count alignment
+                min_prefix_chunk_for_alignment = gpu_count
+                print(f"RLVCR: Large LCM({token_count},{gpu_count})={lcm_tokens_gpus}, using fallback chunk_size={gpu_count}")
+            
+            # Choose final chunk size with efficiency consideration
+            if base_prefix_chunk_size >= min_prefix_chunk_for_alignment:
+                # Use the largest alignment multiple that doesn't waste too much
+                multiplier = base_prefix_chunk_size // min_prefix_chunk_for_alignment
+                prefix_chunk_size = multiplier * min_prefix_chunk_for_alignment
+                
+                # Efficiency check: if dropping below 50%, use base size + runtime padding
+                efficiency = prefix_chunk_size / base_prefix_chunk_size if base_prefix_chunk_size > 0 else 1
+                if efficiency < 0.5:
+                    prefix_chunk_size = base_prefix_chunk_size
+                    print(f"RLVCR: Low efficiency ({efficiency:.1%}), using base chunk size with runtime padding")
+            else:
+                # Use the minimum required for alignment
+                prefix_chunk_size = min_prefix_chunk_for_alignment
+            
+            if prefix_chunk_size != base_prefix_chunk_size:
+                print(f"RLVCR: Adjusted chunk size from {base_prefix_chunk_size} to {prefix_chunk_size} prefixes for GPU alignment")
+            
+            all_results = []
+            
+            for i in range(0, len(input_prefixes), prefix_chunk_size):
+                chunk_prefixes = input_prefixes[i:i + prefix_chunk_size]
+                chunk_results = self._compute_confidence_chunk(chunk_prefixes, action_token_ids, actor_rollout_wg)
+                all_results.extend(chunk_results)
+            
+            return all_results
+        else:
+            # Process all at once
+            return self._compute_confidence_chunk(input_prefixes, action_token_ids, actor_rollout_wg)
+    
+    def _compute_confidence_chunk(
+        self,
+        input_prefixes: List[str],
+        action_token_ids: List[int],
+        actor_rollout_wg
+    ) -> List[float]:
+        """
+        Compute confidence for a chunk of prefixes using autoregressive calculation.
+        For efficiency, we batch process all autoregressive steps together.
+        """
+        if not input_prefixes:
+            return []
+        
+        num_prefixes = len(input_prefixes)
+        num_tokens = len(action_token_ids)
+        
+        # Initialize all prefixes
+        current_inputs = []
+        for prefix in input_prefixes:
+            tokenized = self.tokenizer(prefix, return_tensors='pt', padding=False, truncation=True)
+            current_inputs.append(tokenized['input_ids'][0])
+        
+        # Store log probs for each prefix
+        all_prefix_log_probs = [[] for _ in range(num_prefixes)]
+        
+        # Process each token position autoregressively
+        for token_idx, token_id in enumerate(action_token_ids):
+            # Prepare batch for current token
+            batch_inputs = []
+            for prefix_idx in range(num_prefixes):
+                # Extend current input with target token
+                extended_input = torch.cat([current_inputs[prefix_idx], torch.tensor([token_id])])
+                batch_inputs.append({
+                    'input_ids': extended_input,
+                    'attention_mask': torch.ones_like(extended_input),
+                    'responses': torch.tensor([token_id])
+                })
+            
+            # Pad batch to same length
+            max_len = max(len(inp['input_ids']) for inp in batch_inputs)
+            for inp in batch_inputs:
+                pad_len = max_len - len(inp['input_ids'])
+                if pad_len > 0:
+                    inp['input_ids'] = torch.cat([torch.full((pad_len,), self.tokenizer.pad_token_id), inp['input_ids']])
+                    inp['attention_mask'] = torch.cat([torch.zeros(pad_len), inp['attention_mask']])
+            
+            # GPU alignment
+            original_batch_size = len(batch_inputs)
+            if hasattr(actor_rollout_wg, 'world_size') and actor_rollout_wg.world_size > 1:
+                gpu_count = actor_rollout_wg.world_size
+                if original_batch_size % gpu_count != 0:
+                    pad_size = gpu_count - (original_batch_size % gpu_count)
+                    for _ in range(pad_size):
+                        batch_inputs.append(batch_inputs[-1])  # Duplicate last input
+            
+            # Create batch
+            batch_input_ids = torch.stack([inp['input_ids'] for inp in batch_inputs])
+            batch_attention_mask = torch.stack([inp['attention_mask'] for inp in batch_inputs])
+            batch_position_ids = compute_position_id_with_mask(batch_attention_mask)
+            batch_responses = torch.stack([inp['responses'] for inp in batch_inputs]).unsqueeze(-1)
+            
+            batch = DataProto.from_dict({
+                'input_ids': batch_input_ids,
+                'attention_mask': batch_attention_mask,
+                'position_ids': batch_position_ids,
+                'responses': batch_responses,
+            })
+            
+            # Compute log probabilities
+            # output = self._handle_multi_gpu_log_prob(batch, actor_rollout_wg)
+            # token_log_probs = output.batch['old_log_probs'][:, -1].cpu().numpy()
+            output = self._handle_multi_gpu_entropy(batch, actor_rollout_wg)
+            token_log_probs = output.batch['entropies'][:, -1].cpu().numpy()
+            
+            # Store results for original prefixes only
+            for prefix_idx in range(num_prefixes):
+                all_prefix_log_probs[prefix_idx].append(float(token_log_probs[prefix_idx]))
+            
+            # Update context for next token (autoregressive step)
+            for prefix_idx in range(num_prefixes):
+                current_inputs[prefix_idx] = torch.cat([current_inputs[prefix_idx], torch.tensor([token_id])])
+        
+        # Convert log probs to probs and compute minimum prob for each prefix (confidence measure)
+        results = []
+        # 🔍 调试信息：添加详细打印
+        debug_mode = False
+        if debug_mode:
+            print("\n" + "="*80)
+            print("🔍 RLVCR Confidence Calculation Debug")
+            print("="*80)
+            print(f"Computing confidence for {len(all_prefix_log_probs)} prefixes")
+            print(f"Action tokens: {action_token_ids}")
+            if hasattr(self, 'tokenizer'):
+                action_text = self.tokenizer.decode(action_token_ids, skip_special_tokens=True)
+                print(f"Action text: '{action_text}'")
+        
+        for prefix_idx, prefix_log_probs in enumerate(all_prefix_log_probs):
+            if prefix_log_probs:
+                # Convert log probs to probs for display
+                prefix_probs = [torch.exp(torch.tensor(log_prob)).item() for log_prob in prefix_log_probs]
+                
+                # Use geometric mean: exp(mean(log_probs))
+                mean_log_prob = sum(prefix_log_probs) / len(prefix_log_probs)
+                results.append(mean_log_prob)
+                # geometric_mean_prob = torch.exp(torch.tensor(mean_log_prob)).item()
+                # results.append(geometric_mean_prob)
+                
+            else:
+                results.append(0.0)
+                if debug_mode and prefix_idx < 3:
+                    print(f"\n📋 Prefix {prefix_idx}: No log probs available -> confidence = 0.0")
+        
+        if debug_mode:
+            print(f"\n📊 Summary:")
+            print(f"  Total prefixes: {len(results)}")
+            if results:
+                print(f"  Confidence range: [{min(results):.4f}, {max(results):.4f}]")
+                print(f"  Average confidence: {sum(results)/len(results):.4f}")
+            print("="*80)
+        
+        return results
+
+
+    def _batch_generate_thinking_alternatives(
+        self,
+        successful_indices: List[int],
+        base_batch: DataProto,
+        actor_rollout_wg
+    ) -> List[List[dict]]:
+        """
+        Batch generate thinking alternatives for successful trajectories.
+        Returns list of 4-sample groups for each trajectory.
+        """
+        if not successful_indices:
+            return []
+        
+        trajectory_metadata = []
+        all_generation_prompts = []
+        
+        # Parse trajectories and collect generation prompts
+        for batch_idx in successful_indices:
+            original_sample = self._extract_single_sample(base_batch, batch_idx)
+            original_response = self.tokenizer.decode(base_batch.batch['responses'][batch_idx], skip_special_tokens=True)
+            
+            original_thinking = self._extract_from_response(original_response, 'think')
+            original_action = self._extract_from_response(original_response, 'action')
+            original_level = self._extract_level_from_response(original_response)
+            if not original_action or original_level is None:
+                trajectory_metadata.append({
+                    'batch_idx': batch_idx, 'original_sample': original_sample,
+                    'original_response': original_response, 'valid': False
+                })
+                continue
+            
+            prompt_text = self.tokenizer.decode(base_batch.batch['input_ids'][batch_idx], skip_special_tokens=True)
+            action_token_ids = self.tokenizer.encode(original_action, add_special_tokens=False)
+            generation_prompts_for_traj = []
+            for level in [1, 2, 3, 4]:
+                if level != original_level and level != 1:
+                    modified_prompt = core_rlvcr.create_level_specific_prompt(
+                        history=prompt_text, target_level=level, action=original_action
+                    )
+                    generation_prompts_for_traj.append(modified_prompt)
+            
+            trajectory_metadata.append({
+                'batch_idx': batch_idx, 'original_sample': original_sample,
+                'original_response': original_response, 'original_thinking': original_thinking,
+                'original_action': original_action, 'original_level': original_level,
+                'prompt_text': prompt_text, 'action_token_ids': action_token_ids,
+                'generation_prompts': generation_prompts_for_traj, 'valid': True
+            })
+            all_generation_prompts.extend(generation_prompts_for_traj)
+        
+        # Batch generate thinking sequences with chunking
+        generated_thinking_sequences = []
+        if all_generation_prompts:
+            print(f"RLVCR: Generating {len(all_generation_prompts)} thinking sequences")
+            generated_thinking_sequences = self._batch_generate_thinking_sequences(
+                all_generation_prompts, actor_rollout_wg, base_batch.meta_info.copy(), ""
+            )
+        # Prepare confidence computation
+        all_confidence_prompts = []
+        valid_trajectories = [traj for traj in trajectory_metadata if traj['valid']]
+        
+        generation_idx = 0
+        for traj_meta in valid_trajectories:
+            thinking_texts = []
+            for level in [1, 2, 3, 4]:
+                if level == traj_meta['original_level']:
+                    thinking_texts.append(traj_meta['original_thinking'])
+                elif level == 1:
+                    thinking_texts.append("")
+                else:
+                    thinking_texts.append(generated_thinking_sequences[generation_idx])
+                    generation_idx += 1
+            
+            traj_meta['thinking_texts'] = thinking_texts
+            
+            # Add confidence prompts
+            for level in [1, 2, 3, 4]:
+                thinking_text = thinking_texts[level-1]
+                if level == 1:
+                    input_prefix = traj_meta['original_sample']['raw_prompt'][0]['content'] + f"<level>1</level><action>"
+                else:
+                    input_prefix = traj_meta['original_sample']['raw_prompt'][0]['content'] + f"<level>{level}</level><think>{thinking_text}</think><action>"
+                all_confidence_prompts.append(input_prefix)
+        
+        # Batch compute all confidences
+        all_batch_entropies = []
+        if all_confidence_prompts and valid_trajectories:
+            representative_action_token_ids = valid_trajectories[0]['action_token_ids']
+            all_batch_entropies = self._batch_compute_action_token_logits(
+                all_confidence_prompts, representative_action_token_ids, actor_rollout_wg
+            )
+        # Process results
+        results = []
+        valid_count = 0
+        invalid_count = 0
+        for traj_meta in trajectory_metadata:
+            if not traj_meta['valid']:
+                invalid_count += 1
+                sample = traj_meta['original_sample'].copy()
+                sample.update({
+                    'full_output': traj_meta['original_response'],
+                    'thinking_entropy': 0.0, 'thinking_cost': 0,
+                    'original_level': 1, 'current_level': 1
+                })
+                results.append([sample])
+                continue
+            
+            valid_count += 1
+            
+            # Create 4 samples for this trajectory
+            samples = []
+            traj_idx = valid_trajectories.index(traj_meta)
+            for level in [1, 2, 3, 4]:
+                sample = traj_meta['original_sample'].copy()
+                # Add the original batch_idx for group identification
+                sample['batch_idx'] = traj_meta['batch_idx']
+                
+                if level == traj_meta['original_level']:
+                    sample['responses'] = base_batch.batch['responses'][traj_meta['batch_idx']]
+                    sample['full_output'] = traj_meta['original_response']
+                else:
+                    new_response = self._create_response_with_level(
+                        level, traj_meta['original_action'], traj_meta['thinking_texts'][level-1]
+                    )
+                    sample['responses'] = self.tokenizer.encode(new_response, return_tensors='pt')[0]
+                    sample['full_output'] = new_response
+                
+                entropy_idx = traj_idx * 4 + (level - 1)
+                sample['thinking_entropy'] = all_batch_entropies[entropy_idx] if entropy_idx < len(all_batch_entropies) else 0.0
+                sample['thinking_cost'] = len(self.tokenizer.encode(traj_meta['thinking_texts'][level-1], add_special_tokens=False)) if traj_meta['thinking_texts'][level-1] else 0
+                sample['original_level'] = traj_meta['original_level']
+                sample['current_level'] = level
+                samples.append(sample)
+            
+            results.append(samples)
+        
+        print(f"RLVCR: {valid_count} valid, {invalid_count} invalid successful trajectories")
+        print(f"RLVCR: Returning {len(results)} trajectory groups")
+        return results
