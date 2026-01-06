@@ -1,0 +1,74 @@
+# RLVCR Reward Shaping Configuration
+# Based on adaptive reward shaping strategies from the paper
+
+algorithm:
+  adv_estimator: rlvcr
+  
+  # RLVCR specific parameters
+  rlvcr:
+    enable: true
+    
+    # Action advantage weight (beta in the paper)
+    # Controls the importance of thinking advantage vs action advantage
+    thinking_weight: 0.5  # β: final_adv = action_adv + β * thinking_adv
+    
+    # Thinking cost weight (alpha in the paper)
+    # Base weight for length/cost penalty
+    thinking_cost_weight: 0.01  # α_base: will be scaled by level
+    
+    # Entropy scale factor
+    # Controls the importance of action confidence (min probability)
+    entropy_scale: 1.0
+    
+    # Mode for advantage normalization
+    mode: mean_norm  # or mean_std_norm
+    
+    # Level-specific scaling factors
+    # These multiply the base cost weight for each thinking level
+    # Higher values = stronger penalty for thinking tokens
+    level_cost_scales:
+      level_1: 2.0  # Strongest compression (no thinking allowed)
+      level_2: 1.5  # Moderate compression
+      level_3: 1.0  # Balanced
+      level_4: 0.5  # Least compression (deep thinking allowed)
+    
+    # Cost normalization bounds
+    # Used to normalize thinking token counts to [0, 1]
+    cost_min: 0    # Minimum thinking tokens (level 1)
+    cost_max: 50   # Maximum reasonable thinking tokens
+    
+    # Success-based modulation
+    # Whether to apply different reward shaping for successful vs failed samples
+    success_modulation: true
+    
+    # Reward components breakdown (for logging)
+    log_components: true
+
+# Training parameters that interact with RLVCR
+trainer:
+  # Only process successful trajectories for thinking alternatives
+  rlvcr_success_only: true
+  
+  # Expansion factor (how many thinking levels to generate)
+  # Default is 4 (levels 1-4)
+  rlvcr_num_levels: 4
+  
+  # Whether to include failed samples in training
+  # If false, only successful trajectories are used
+  include_failed_samples: true
+
+# Example usage in code:
+# The reward for thinking level i is computed as:
+# 
+# R_thinking = R_entropy + α^(level) * R_length
+# 
+# Where:
+# - R_entropy = min_prob * entropy_scale (action confidence)
+# - R_length = 0.5 - (cost - cost_min)/(cost_max - cost_min) (length penalty)
+# - α^(level) = thinking_cost_weight * level_cost_scales[level]
+#
+# For successful samples: R_length is used as-is
+# For failed samples: R_length = min(0, R_length) (only penalties)
+#
+# Final advantage within thinking group:
+# adv_i = R_thinking_i - mean(R_thinking_group)

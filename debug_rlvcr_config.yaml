@@ -1,0 +1,21 @@
+# RLVCR调试配置示例
+# 在你的训练配置文件中添加以下内容来启用confidence计算调试
+
+algorithm:
+  rlvcr:
+    # 启用confidence计算调试
+    debug_confidence: true
+    
+    # 其他RLVCR参数保持不变
+    thinking_weight: 0.5
+    thinking_cost_alpha: 1.0
+    cost_max: 250
+    confidence_chunk_size: 32  # 可选：调整chunk size
+
+# 这将在训练过程中打印详细的confidence计算信息，包括：
+# 1. 每个prefix的内容（最后100个字符）
+# 2. Action tokens和对应的文本
+# 3. 每个token的log_prob和prob
+# 4. 所有token的概率列表
+# 5. 最终的confidence（最小概率）
+# 6. 统计摘要信息

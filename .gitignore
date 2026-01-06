@@ -1,0 +1,6 @@
+__pycache__
+wandb
+outputs
+checkpoints
+*.pyc
+*.log
