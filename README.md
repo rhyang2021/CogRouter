@@ -1,8 +1,24 @@
-# CogRouter: Think Fast and Slow — Step-Level Cognitive Depth Adaptation for LLM Agents
+<div align="center">
+
+# Think Fast and Slow: Step-Level Cognitive Depth Adaptation for LLM Agents
+
+<div>
+  <a href='https://scholar.google.com/citations?user=asTSVwQAAAAJ&hl=en' target='_blank'><b>Ruihan Yang</b></a><sup>1</sup>&emsp;
+  <b>Fanghua Ye</b><sup>2</sup>&emsp;
+</div>
+<div><sup>1</sup>Fudan University</div>
+<div><sup>2</sup>Tencent Hunyuan</div>
+<div>
+
+![](https://img.shields.io/badge/PRs-welcome-brightgreen) 
+<img src="https://img.shields.io/badge/Version-1.0-blue.svg" alt="Version">
+
+</div>
+
+<img width="800" alt="CogRouter Framework" src="figures/copo.pdf">
+</div>
 
 CogRouter trains agents to **dynamically adapt cognitive depth at each step**. Grounded in ACT-R theory, we design four hierarchical cognitive levels ranging from instinctive responses to strategic planning, and propose **Cognition-aware Policy Optimization (CoPo)** for step-level credit assignment via confidence-aware advantage reweighting.
-
-![CogRouter Framework](figures/copo.pdf)
 
 ## Environment Setup
 
