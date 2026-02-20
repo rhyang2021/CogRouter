@@ -11,7 +11,7 @@
 [![](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com) 
 <img src="https://img.shields.io/badge/Version-1.0-blue.svg" alt="Version">
 
-<img width="800" alt="CogRouter Framework" src="figures/copo.png">
+<img width="780" alt="CogRouter Framework" src="figures/copo.png">
 
 </div>
 
