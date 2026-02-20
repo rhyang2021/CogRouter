@@ -1,7 +1,7 @@
 """
-RLVCR (RL with Variational Chain Reasoning) core algorithms.
+CoPo (RL with Variational Chain Reasoning) core algorithms.
 
-This module implements the RLVCR advantage computation method that combines:
+This module implements the CoPo advantage computation method that combines:
 1. Trajectory-level advantages (similar to existing methods)
 2. Thinking-level advantages based on thinking diversity and token efficiency
 """
@@ -61,7 +61,7 @@ def compute_format_penalty(responses: list, thinking_levels: np.array = None) ->
     
     return np.array(format_penalties)
 
-def compute_rlvcr_outcome_advantage(
+def compute_copo_outcome_advantage(
     token_level_rewards: torch.Tensor,
     eos_mask: torch.Tensor,
     index: np.array,
@@ -79,7 +79,7 @@ def compute_rlvcr_outcome_advantage(
     ada_grpo_enabled: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
     """
-    Compute RLVCR outcome advantages with dual advantage calculation.
+    Compute CoPo outcome advantages with dual advantage calculation.
     
     Args:
         token_level_rewards: Episode-level token rewards
@@ -101,7 +101,7 @@ def compute_rlvcr_outcome_advantage(
     """
     batch_size = token_level_rewards.shape[0]
     
-    print(f" RLVCR Advantage Computation Debug:")
+    print(f" CoPo Advantage Computation Debug:")
     print(f"    batch_size: {batch_size}")
     print(f"    thinking_group_ids: {thinking_group_ids}")
     print(f"    is_original: {is_original}")
@@ -421,20 +421,20 @@ def compute_rlvcr_outcome_advantage(
 
     # Compute summary metrics for logging
     metrics = {
-        'rlvcr/weight_annealing_progress': float(progress),
+        'copo/weight_annealing_progress': float(progress),
     }
     
     if weight_metrics['target_weights']:
         metrics.update({
-            'rlvcr/target_weight_mean': float(np.mean(weight_metrics['target_weights'])),
-            'rlvcr/target_weight_max': float(np.max(weight_metrics['target_weights'])),
-            'rlvcr/target_weight_min': float(np.min(weight_metrics['target_weights'])),
-            'rlvcr/annealed_weight_mean': float(np.mean(weight_metrics['annealed_weights'])),
-            'rlvcr/annealed_weight_max': float(np.max(weight_metrics['annealed_weights'])),
-            'rlvcr/annealed_weight_min': float(np.min(weight_metrics['annealed_weights'])),
-            'rlvcr/thinking_prob_mean': float(np.mean(weight_metrics['thinking_probs'])),
-            'rlvcr/thinking_prob_max': float(np.max(weight_metrics['thinking_probs'])),
-            'rlvcr/thinking_prob_min': float(np.min(weight_metrics['thinking_probs'])),
+            'copo/target_weight_mean': float(np.mean(weight_metrics['target_weights'])),
+            'copo/target_weight_max': float(np.max(weight_metrics['target_weights'])),
+            'copo/target_weight_min': float(np.min(weight_metrics['target_weights'])),
+            'copo/annealed_weight_mean': float(np.mean(weight_metrics['annealed_weights'])),
+            'copo/annealed_weight_max': float(np.max(weight_metrics['annealed_weights'])),
+            'copo/annealed_weight_min': float(np.min(weight_metrics['annealed_weights'])),
+            'copo/thinking_prob_mean': float(np.mean(weight_metrics['thinking_probs'])),
+            'copo/thinking_prob_max': float(np.max(weight_metrics['thinking_probs'])),
+            'copo/thinking_prob_min': float(np.min(weight_metrics['thinking_probs'])),
         })
 
     return advantages, returns, metrics

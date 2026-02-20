@@ -1,5 +1,5 @@
 """
-RLVCR Thinking Level Prompts
+CoPo Thinking Level Prompts
 Defines different thinking level templates for generating alternative thinking patterns
 """
 

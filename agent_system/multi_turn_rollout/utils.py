@@ -89,13 +89,13 @@ def adjust_batch(config, data: DataProto) -> DataProto:
         # Smart removal strategy: prioritize failed trajectories and preserve thinking groups
         remove_indices = []
         
-        # Check if we have RLVCR thinking group information
+        # Check if we have CoPo thinking group information
         if 'thinking_group_id' in data.non_tensor_batch:
             thinking_group_ids = data.non_tensor_batch['thinking_group_id']
             is_original = data.non_tensor_batch.get('is_original', None)
             episode_rewards = data.non_tensor_batch.get('episode_rewards', None)
             
-            print(f"DEBUG adjust_batch: RLVCR mode - prioritizing failed trajectories")
+            print(f"DEBUG adjust_batch: CoPo mode - prioritizing failed trajectories")
             
             # Strategy 1: Remove failed trajectory samples first (thinking_group_id = -1)
             failed_indices = np.where(thinking_group_ids == -1)[0]

@@ -20,7 +20,7 @@ python3 -m examples.data_preprocess.prepare \
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    algorithm.rlvcr.enable=False \
+    algorithm.copo.enable=False \
     algorithm.use_kl_in_reward=False \
     data.train_files=$HOME/data/verl-agent/text/train.parquet \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
@@ -31,14 +31,14 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=/apdcephfs_cq11/share_1567347/share_info/rhyang/AdaAgent/models/qwen2.5-7b_cog-sft_balance_alf_lr2e6_bs16_epoch5_full_0915 \
-    actor_rollout_ref.actor.optim.lr=5e-7 \
+    actor_rollout_ref.model.path="/apdcephfs_cq11/share_1567347/share_info/rhyang/AdaAgent/models/llama3.1-8b_cog-sft_verl_v2_alf_lr2e6_bs32_epoch3_full_1027/checkpoint-600" \
+    actor_rollout_ref.actor.optim.lr=2e-7 \
     actor_rollout_ref.actor.grad_clip=1 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.01 \
+    actor_rollout_ref.actor.kl_loss_coef=0.05 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
@@ -53,7 +53,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
@@ -62,12 +62,12 @@ python3 -m verl.trainer.main_ppo \
     env.max_steps=30 \
     env.rollout.n=$group_size \
     env.alfworld.generalization_level=3 \
-    +env.alfworld.action_only=True \
-    env.alfworld.meta_think=False \
+    +env.alfworld.action_only=False \
+    env.alfworld.meta_think=True \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='rlvcr_alfworld' \
-    trainer.experiment_name='grpo_qwen2.5-7b_alf_level4_cold_start_lr5e7_bs32_kl0.01_1103' \
+    trainer.project_name='copo_alfworld' \
+    trainer.experiment_name='gigrpo_llama3.1-8b_alf_balance_cold_start_lr2e7_ds64_bs16_1106' \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.resume_mode=auto \

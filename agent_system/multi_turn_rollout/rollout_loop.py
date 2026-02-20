@@ -15,21 +15,21 @@ from typing import List, Dict, Tuple, Any, Optional, Union
 from collections import defaultdict
 
 from rlvmr import core_rlvmr as core_mcrl
-from rlvcr import core_rlvcr
+from copo import core_copo
 
 
 class TrajectoryCollector:
     """
-    RLVCR 执行流程：
+    CoPo 执行流程：
     1. multi_turn_loop() - 主入口，选择执行模式
-    2. rlvcr_multi_turn_loop() - RLVCR 主流程
+    2. copo_multi_turn_loop() - CoPo 主流程
        a. vanilla_multi_turn_loop() - 收集基础轨迹
        b. gather_rollout_data() - 整理数据
        c. _generate_alternative_thinking_levels() - 生成思考变体
     3. _generate_alternative_thinking_levels() - 生成4个思考等级
        a. 分组样本（失败/相同奖励/需扩展）
        b. _batch_generate_thinking_alternatives() - 批量生成思考
-       c. _rlvcr_collate_fn() - 整理最终数据
+       c. _copo_collate_fn() - 整理最终数据
     """
     
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
@@ -46,17 +46,17 @@ class TrajectoryCollector:
             is_train: bool = True,
             ) -> DataProto:
         """
-        Select and run the appropriate rollout loop (RLVCR, dynamic, or vanilla).
+        Select and run the appropriate rollout loop (CoPo, dynamic, or vanilla).
         """
-        # Check if RLVCR sampling should be used
+        # Check if CoPo sampling should be used
         if (hasattr(self.config, 'algorithm') and 
             hasattr(self.config.algorithm, 'adv_estimator') and 
-            self.config.algorithm.adv_estimator == 'rlvcr' and
-            hasattr(self.config.algorithm, 'rlvcr') and 
-            self.config.algorithm.rlvcr.enable and
+            self.config.algorithm.adv_estimator == 'copo' and
+            hasattr(self.config.algorithm, 'copo') and 
+            self.config.algorithm.copo.enable and
             is_train):
-            # RLVCR Sampling
-            return self.rlvcr_multi_turn_loop(
+            # CoPo Sampling
+            return self.copo_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
                 envs=envs,
@@ -78,7 +78,7 @@ class TrajectoryCollector:
                 envs=envs,
             )
 
-        # Process non-RLVCR results
+        # Process non-CoPo results
         assert len(total_batch_list) == len(total_episode_rewards)
         assert len(total_batch_list) == len(total_episode_lengths)
         assert len(total_batch_list) == len(total_traj_uid)
@@ -104,20 +104,20 @@ class TrajectoryCollector:
             gen_batch_output.meta_info["mcrl_mode"] = self.config.algorithm.mcrl.mode
         return gen_batch_output
 
-    # ========== RLVCR 主流程 ==========
-    def rlvcr_multi_turn_loop(
+    # ========== CoPo 主流程 ==========
+    def copo_multi_turn_loop(
             self,
             gen_batch: DataProto, 
             actor_rollout_wg, 
             envs: EnvironmentManagerBase,
             ) -> DataProto:
         """
-        RLVCR trajectory collection with multi-level thinking generation.
+        CoPo trajectory collection with multi-level thinking generation.
         执行步骤：
         1. 收集基础轨迹
         2. 转换为 DataProto 格式
         3. 生成思考等级变体
-        4. 添加 RLVCR 元信息
+        4. 添加 CoPo 元信息
         """
         # Step 1: Collect base trajectories
         total_batch_list, episode_rewards, episode_lengths, success, traj_uid, total_infos = \
@@ -136,12 +136,12 @@ class TrajectoryCollector:
         # Step 3: Generate alternative thinking levels
         base_result = self._generate_alternative_thinking_levels(base_result, actor_rollout_wg)
         
-        # Step 4: Store RLVCR configuration
-        rlvcr_config = self.config.algorithm.rlvcr
+        # Step 4: Store CoPo configuration
+        copo_config = self.config.algorithm.copo
         base_result.meta_info.update({
-            "rlvcr_thinking_weight": getattr(rlvcr_config, 'thinking_weight', 0.5),
-            "rlvcr_thinking_diversity_w": getattr(rlvcr_config, 'thinking_diversity_w', 1.0),
-            "rlvcr_mode": getattr(rlvcr_config, 'mode', 'mean_norm')
+            "copo_thinking_weight": getattr(copo_config, 'thinking_weight', 0.5),
+            "copo_thinking_diversity_w": getattr(copo_config, 'thinking_diversity_w', 1.0),
+            "copo_mode": getattr(copo_config, 'mode', 'mean_norm')
         })
     
         return base_result
@@ -153,7 +153,7 @@ class TrajectoryCollector:
             actor_rollout_wg
         ) -> DataProto:
         """
-        生成 RLVCR 的思考等级变体。
+        生成 CoPo 的思考等级变体。
         执行步骤：
         1. 按 UID 分组，检查奖励相似性
         2. 分类样本：失败/相同奖励/需扩展
@@ -181,12 +181,12 @@ class TrajectoryCollector:
                 reward_range = max(rewards) - min(rewards)
                 if reward_range < 1e-6:  # 浮点精度阈值
                     identical_reward_uids.add(uid)
-                    print(f"RLVCR: UID {uid} has identical rewards ({rewards[0]:.6f}), will skip thinking expansion")
+                    print(f"CoPo: UID {uid} has identical rewards ({rewards[0]:.6f}), will skip thinking expansion")
                 else:
                     different_reward_uids.add(uid)
         
-        print(f"RLVCR: {len(identical_reward_uids)} UIDs with identical rewards (will skip expansion)")
-        print(f"RLVCR: {len(different_reward_uids)} UIDs with different rewards (will expand)")
+        print(f"CoPo: {len(identical_reward_uids)} UIDs with identical rewards (will skip expansion)")
+        print(f"CoPo: {len(different_reward_uids)} UIDs with different rewards (will expand)")
         
         # Step 2: 分类样本
         failed_indices = []  # 失败轨迹（不再使用，但保留结构）
@@ -204,9 +204,9 @@ class TrajectoryCollector:
             else:
                 expand_thinking_indices.append(batch_idx)
         
-        print(f"RLVCR: {len(failed_indices)} failed trajectories")
-        print(f"RLVCR: {len(skip_thinking_indices)} trajectories with identical rewards (skip expansion)")
-        print(f"RLVCR: {len(expand_thinking_indices)} trajectories to expand")
+        print(f"CoPo: {len(failed_indices)} failed trajectories")
+        print(f"CoPo: {len(skip_thinking_indices)} trajectories with identical rewards (skip expansion)")
+        print(f"CoPo: {len(expand_thinking_indices)} trajectories to expand")
         
         # Step 3: 处理各类样本
         all_samples = []
@@ -247,11 +247,11 @@ class TrajectoryCollector:
         # 处理需要扩展的轨迹
         invalid_format_count = 0
         if expand_thinking_indices:
-            print(f"RLVCR: Batch processing {len(expand_thinking_indices)} trajectories for thinking expansion")
+            print(f"CoPo: Batch processing {len(expand_thinking_indices)} trajectories for thinking expansion")
             successful_samples, invalid_format_count = self._batch_generate_thinking_alternatives(
                 expand_thinking_indices, base_batch, actor_rollout_wg
             )
-            print(f"RLVCR: Generated {len(successful_samples)} trajectory groups")
+            print(f"CoPo: Generated {len(successful_samples)} trajectory groups")
             
             for samples_group in successful_samples:
                 if len(samples_group) == 4:
@@ -281,7 +281,7 @@ class TrajectoryCollector:
         for new_idx, sample in enumerate(all_samples):
             sample['batch_idx'] = new_idx
         
-        print(f"RLVCR: Final sample count:")
+        print(f"CoPo: Final sample count:")
         print(f"  - Identical rewards (skipped): {len(skip_thinking_indices)}")
         print(f"  - Invalid format (skipped): {invalid_format_count}")
         print(f"  - Expanded groups: {len(successful_samples) if 'successful_samples' in locals() else 0}")
@@ -289,7 +289,7 @@ class TrajectoryCollector:
         
         # Step 4: 创建扩展后的批次
         expanded_batch = DataProto.from_single_dict(
-            data=self._rlvcr_collate_fn(all_samples),
+            data=self._copo_collate_fn(all_samples),
             meta_info=base_batch.meta_info
         )
         
@@ -297,9 +297,9 @@ class TrajectoryCollector:
         expanded_batch.meta_info.update({
             'original_indices': original_indices,
             'expanded_indices': expanded_indices,
-            'rlvcr_invalid_format_count': invalid_format_count,
-            'rlvcr_identical_reward_count': len(skip_thinking_indices),
-            'rlvcr_expanded_count': len(expand_thinking_indices)
+            'copo_invalid_format_count': invalid_format_count,
+            'copo_identical_reward_count': len(skip_thinking_indices),
+            'copo_expanded_count': len(expand_thinking_indices)
         })
         
         return expanded_batch
@@ -336,7 +336,7 @@ class TrajectoryCollector:
 
             if not original_action or not original_thinking or original_level is None:
             # if not original_action or original_level is None:
-                print(f"RLVCR: Original response for trajectory {batch_idx} has invalid format, skipping expansion")
+                print(f"CoPo: Original response for trajectory {batch_idx} has invalid format, skipping expansion")
                 trajectory_metadata.append({
                     'batch_idx': batch_idx, 'original_sample': original_sample,
                     'original_response': original_response, 'valid': False
@@ -350,7 +350,7 @@ class TrajectoryCollector:
             
             for level in [1, 2, 3, 4]:
                 if level != original_level and level != 1:  # Level 1 不需要思考，其他等级需要生成
-                    modified_prompt = core_rlvcr.create_level_specific_prompt(
+                    modified_prompt = core_copo.create_level_specific_prompt(
                         history=prompt_text, target_level=level, action=original_action
                     )
                     generation_prompts_for_traj.append(modified_prompt)
@@ -367,7 +367,7 @@ class TrajectoryCollector:
         # Step 2: 批量生成思考序列
         generated_thinking_sequences = []
         if all_generation_prompts:
-            print(f"RLVCR: Generating {len(all_generation_prompts)} thinking sequences")
+            print(f"CoPo: Generating {len(all_generation_prompts)} thinking sequences")
             generated_thinking_sequences = self._batch_generate_thinking_sequences(
                 all_generation_prompts, actor_rollout_wg, base_batch.meta_info.copy()
             )
@@ -457,7 +457,7 @@ class TrajectoryCollector:
             
             results.append(samples)
         
-        print(f"RLVCR: {valid_count} valid, {invalid_count} invalid trajectories")
+        print(f"CoPo: {valid_count} valid, {invalid_count} invalid trajectories")
         return results, invalid_count
 
     # ========== 基础轨迹收集 ==========
@@ -921,7 +921,7 @@ class TrajectoryCollector:
             return []
         
         # Get chunking configuration
-        generation_chunk_size = getattr(self.config.algorithm.rlvcr, 'generation_chunk_size', 256)
+        generation_chunk_size = getattr(self.config.algorithm.copo, 'generation_chunk_size', 256)
         
         # Process in chunks if needed
         if len(prompts) > generation_chunk_size:
@@ -1026,12 +1026,12 @@ class TrajectoryCollector:
         
         try:
             # 优化1：大幅增加 batch size
-            confidence_chunk_size = getattr(self.config.algorithm.rlvcr, 'confidence_chunk_size', 2048)
+            confidence_chunk_size = getattr(self.config.algorithm.copo, 'confidence_chunk_size', 2048)
         except AttributeError:
             confidence_chunk_size = min(1024, base_micro_batch_size * 64)
         
-        print(f"RLVCR [OPTIMIZED]: Computing {total_computations} confidence calculations, chunk_size={confidence_chunk_size}")
-        print(f"RLVCR [OPTIMIZED]: {len(input_prefixes)} prefixes * {len(action_token_ids)} tokens = {total_computations} total calculations")
+        print(f"CoPo [OPTIMIZED]: Computing {total_computations} confidence calculations, chunk_size={confidence_chunk_size}")
+        print(f"CoPo [OPTIMIZED]: {len(input_prefixes)} prefixes * {len(action_token_ids)} tokens = {total_computations} total calculations")
         
         if total_computations > confidence_chunk_size:
             # Process in chunks with GPU-friendly sizing
@@ -1048,7 +1048,7 @@ class TrajectoryCollector:
             max_reasonable_lcm = gpu_count * 16
             if lcm_tokens_gpus > max_reasonable_lcm:
                 min_prefix_chunk_for_alignment = gpu_count
-                print(f"RLVCR: Large LCM({token_count},{gpu_count})={lcm_tokens_gpus}, using fallback chunk_size={gpu_count}")
+                print(f"CoPo: Large LCM({token_count},{gpu_count})={lcm_tokens_gpus}, using fallback chunk_size={gpu_count}")
             
             # Choose final chunk size
             if base_prefix_chunk_size >= min_prefix_chunk_for_alignment:
@@ -1058,12 +1058,12 @@ class TrajectoryCollector:
                 efficiency = prefix_chunk_size / base_prefix_chunk_size if base_prefix_chunk_size > 0 else 1
                 if efficiency < 0.5:
                     prefix_chunk_size = base_prefix_chunk_size
-                    print(f"RLVCR: Low efficiency ({efficiency:.1%}), using base chunk size with runtime padding")
+                    print(f"CoPo: Low efficiency ({efficiency:.1%}), using base chunk size with runtime padding")
             else:
                 prefix_chunk_size = min_prefix_chunk_for_alignment
             
             if prefix_chunk_size != base_prefix_chunk_size:
-                print(f"RLVCR: Adjusted chunk size from {base_prefix_chunk_size} to {prefix_chunk_size} prefixes for GPU alignment")
+                print(f"CoPo: Adjusted chunk size from {base_prefix_chunk_size} to {prefix_chunk_size} prefixes for GPU alignment")
             
             all_results = []
             
@@ -1167,8 +1167,8 @@ class TrajectoryCollector:
         
         return results
 
-    def _rlvcr_collate_fn(self, data_list: list[dict]) -> dict:
-        """RLVCR 专用的数据整理函数（处理变长响应）。"""
+    def _copo_collate_fn(self, data_list: list[dict]) -> dict:
+        """CoPo 专用的数据整理函数（处理变长响应）。"""
         tensors = defaultdict(list)
         non_tensors = defaultdict(list)
 

@@ -13,38 +13,63 @@ train_data_size=16                    # 保持原来的8
 val_data_size=200
 group_size=4                         # 保持原来的4
 
+# COPO核心配置参数
+COPO_THINKING_WEIGHT=0           # Beta: Weight for thinking advantages in final advantage
+COPO_THINKING_COST_ALPHA=0        # Alpha: Weight for thinking cost penalty in reward
+COPO_COST_MAX=250                   # 保持原来的250
+COPO_MODE="mean_norm"               # Normalization mode
+
+# COPO分批处理优化配置 (性能优化版本)
+COPO_GENERATION_CHUNK_SIZE=256       # 8→16，减少思维生成batch数量
+COPO_CONFIDENCE_CHUNK_SIZE=2048       # 32→64，减少置信度计算调用次数
+
+# COPO日志配置
+COPO_SAVE_CASES=True                # Whether to save thinking cases for analysis
+COPO_MAX_CASES_PER_EPOCH=20         # Maximum cases to save per epoch
+
 python3 -m examples.data_preprocess.prepare \
 --mode 'text' \
 --train_data_size $train_data_size \
 --val_data_size $val_data_size
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
-    algorithm.rlvcr.enable=False \
+    algorithm.adv_estimator=copo \
+    algorithm.copo.enable=True \
+    algorithm.copo.thinking_weight=${COPO_THINKING_WEIGHT} \
+    algorithm.copo.thinking_cost_alpha=${COPO_THINKING_COST_ALPHA} \
+    algorithm.copo.cost_max=${COPO_COST_MAX} \
+    algorithm.copo.mode=${COPO_MODE} \
+    +algorithm.copo.generation_chunk_size=${COPO_GENERATION_CHUNK_SIZE} \
+    +algorithm.copo.confidence_chunk_size=${COPO_CONFIDENCE_CHUNK_SIZE} \
+    copo_save_cases=${COPO_SAVE_CASES} \
+    copo_max_cases_per_epoch=${COPO_MAX_CASES_PER_EPOCH} \
     algorithm.use_kl_in_reward=False \
     data.train_files=$HOME/data/verl-agent/text/train.parquet \
     data.val_files=$HOME/data/verl-agent/text/test.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
-    data.max_prompt_length=30000 \
+    data.max_prompt_length=18000 \
     data.max_response_length=1024 \
     data.filter_overlong_prompts=True \
-    data.truncation='left' \
+    data.truncation='error' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path="/apdcephfs_cq11/share_1567347/share_info/rhyang/AdaAgent/models/qwen2.5-7b_cog-sft_verl_v2_sci_lr2e6_bs32_epoch3_full_1018/checkpoint-1500" \
+    actor_rollout_ref.model.path="/apdcephfs_cq11/share_1567347/share_info/llm_models/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28" \
     actor_rollout_ref.actor.optim.lr=5e-7 \
     actor_rollout_ref.actor.grad_clip=1 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.01 \
+    actor_rollout_ref.actor.kl_loss_coef=0.1 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    +actor_rollout_ref.actor.kl_loss_coef_annealing=False \
+    +actor_rollout_ref.actor.kl_loss_coef_init=0.05 \
+    +actor_rollout_ref.actor.kl_loss_coef_final=0.15 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=31024 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=20000 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
@@ -57,20 +82,21 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
-    env.env_name=sciworld/ScienceWorldEnv \
+    env.env_name=alfworld/AlfredTWEnv \
     env.seed=0 \
-    env.max_steps=40 \
+    env.max_steps=30 \
     env.rollout.n=$group_size \
-    env.sciworld.generalization_level=3 \
-    env.sciworld.meta_think=False \
+    env.alfworld.generalization_level=3 \
+    +env.alfworld.action_only=False \
+    env.alfworld.meta_think=True \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='rlvcr_sciworld' \
-    trainer.experiment_name='grpo_qwen2.5-7b_sci_balance_cold_start_lr5e7_bs32_kl0.01_level4_1111' \
+    trainer.project_name='copo_alfworld' \
+    trainer.experiment_name='copo_qwen2.5-7b_alf_wo_cold_start_lr5e7_bs32_kl0.1_1113' \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.resume_mode=auto \
-    trainer.save_freq=10 \
+    trainer.save_freq=20 \
     trainer.test_freq=5 \
     trainer.total_epochs=200 \
     trainer.val_before_train=True $@
