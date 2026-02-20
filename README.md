@@ -57,7 +57,7 @@ pip install -e .
 
 ## Start Training
 
-1. **RL Training**
+**RL Training**
 
 ```bash
 bash examples/copo_trainer/run_alfworld.sh
@@ -81,3 +81,5 @@ bash examples/copo_trainer/run_sciworld.sh
 ## Acknowledgement
 
 We sincerely appreciate the infrastructure provided by [veRL](https://github.com/volcengine/verl) and [verl-agent](https://github.com/langfengQ/verl-agent). We also thank [ALFWorld](https://github.com/alfworld/alfworld), [ScienceWorld](https://github.com/allenai/ScienceWorld), and other projects for offering interactive agent environments.
+
+If you have any questions, please feel free to [email](mailto:rhyang17@fudan.edu.cn) me or drop me an issue.
