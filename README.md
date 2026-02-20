@@ -8,8 +8,10 @@
 
 <sup>1</sup>Fudan University&emsp;<sup>2</sup>Tencent Hunyuan
 
-[![](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com) 
+[![](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/rhyang2021/CogRouter) 
 <img src="https://img.shields.io/badge/Version-1.0-blue.svg" alt="Version">
+<img src="https://img.shields.io/github/stars/rhyang2021/CogRouter?color=yellow" alt="Stars">
+<img src="https://img.shields.io/github/issues/rhyang2021/CogRouter?color=red" alt="Issues">
 
 <img width="780" alt="CogRouter Framework" src="figures/copo.png">
 
